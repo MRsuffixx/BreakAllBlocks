@@ -2,9 +2,13 @@ package com.mrsuffix.breakallblocks;
 
 import com.mrsuffix.breakallblocks.commands.BabCommandHandler;
 import com.mrsuffix.breakallblocks.listeners.BlockBreakListener;
+import com.mrsuffix.breakallblocks.listeners.BlockDropItemListener;
 import com.mrsuffix.breakallblocks.listeners.ChunkLoadListener;
+import com.mrsuffix.breakallblocks.listeners.EntityDeathListener;
 import com.mrsuffix.breakallblocks.managers.ConfigManager;
 import com.mrsuffix.breakallblocks.managers.EliminationManager;
+import com.mrsuffix.breakallblocks.managers.EntityMappingManager;
+import com.mrsuffix.breakallblocks.managers.UndoManager;
 import com.mrsuffix.breakallblocks.managers.WaveManager;
 import com.mrsuffix.breakallblocks.managers.WorldScanner;
 import org.bukkit.Bukkit;
@@ -13,19 +17,20 @@ import org.bukkit.plugin.java.JavaPlugin;
 /**
  * BreakAllBlocks — Main plugin class.
  *
- * <p>When a player breaks any block, a BFS wave propagates outward from that
- * location, breaking every connected block of the same type one by one in a
- * cinematic cascade. The material is then permanently eliminated.</p>
+ * <p>Breaking a block (or killing a mapped mob) triggers a BFS wave that
+ * spreads outward, eliminating every connected block of that type, permanently.</p>
  *
  * @author  MRsuffix
- * @version 1.0.0
+ * @version 1.1.0
  */
 public final class BreakAllBlocks extends JavaPlugin {
 
-    private ConfigManager      configManager;
-    private EliminationManager eliminationManager;
-    private WaveManager        waveManager;
-    private WorldScanner       worldScanner;
+    private ConfigManager       configManager;
+    private EliminationManager  eliminationManager;
+    private EntityMappingManager entityMappingManager;
+    private WaveManager         waveManager;
+    private UndoManager         undoManager;
+    private WorldScanner        worldScanner;
 
     @Override
     public void onEnable() {
@@ -41,21 +46,30 @@ public final class BreakAllBlocks extends JavaPlugin {
         this.eliminationManager = new EliminationManager(this, configManager);
         eliminationManager.load();
 
-        // 2. Wave engine
+        // 2. Entity mapping (mob kill → blocks)
+        this.entityMappingManager = new EntityMappingManager(this);
+        entityMappingManager.load();
+
+        // 3. Wave engine (UndoManager set after creation to break circular dep)
         this.waveManager = new WaveManager(this, configManager, eliminationManager);
 
-        // 3. Startup scanner (finds leftover eliminated blocks and starts cleanup waves)
+        // 4. Undo system
+        this.undoManager = new UndoManager(this, configManager, eliminationManager);
+        waveManager.setUndoManager(undoManager);
+
+        // 5. Startup scanner
         this.worldScanner = new WorldScanner(this, configManager, eliminationManager, waveManager);
 
-        // 4. Register event listeners
-        getServer().getPluginManager().registerEvents(
-                new BlockBreakListener(this, configManager, eliminationManager, waveManager), this);
-        getServer().getPluginManager().registerEvents(
-                new ChunkLoadListener(this, configManager, eliminationManager, waveManager), this);
+        // 6. Register listeners
+        var pm = getServer().getPluginManager();
+        pm.registerEvents(new BlockBreakListener(this, configManager, eliminationManager, waveManager), this);
+        pm.registerEvents(new ChunkLoadListener(this, configManager, eliminationManager, waveManager), this);
+        pm.registerEvents(new EntityDeathListener(this, configManager, eliminationManager, entityMappingManager, waveManager), this);
+        pm.registerEvents(new BlockDropItemListener(waveManager), this);
 
-        // 5. Register /bab command
-        BabCommandHandler cmdHandler =
-                new BabCommandHandler(this, configManager, eliminationManager, waveManager, worldScanner);
+        // 7. Register /bab command
+        var cmdHandler = new BabCommandHandler(this, configManager, eliminationManager,
+                waveManager, undoManager, worldScanner);
         var cmd = getCommand("bab");
         if (cmd != null) {
             cmd.setExecutor(cmdHandler);
@@ -64,17 +78,16 @@ public final class BreakAllBlocks extends JavaPlugin {
             getLogger().severe("Failed to register /bab command — check plugin.yml!");
         }
 
-        // 6. Schedule startup re-scan (60 ticks = 3 s after enable, so the world
-        //    finishes loading before we scan chunks).
+        // 8. Startup cleanup scan (after 3 s / 60 ticks)
         if (configManager.isEnabled() && !eliminationManager.getEliminatedMaterials().isEmpty()) {
-            getLogger().info("Scheduling startup cleanup scan for "
+            getLogger().info("[BAB] Scheduling startup cleanup scan for "
                     + eliminationManager.getEliminatedMaterials().size()
                     + " eliminated material(s)…");
             Bukkit.getScheduler().runTaskLater(this,
                     () -> worldScanner.scanAllWorldsForEliminated(null), 60L);
         }
 
-        getLogger().info("Plugin enabled successfully!");
+        getLogger().info("[BAB] Plugin enabled successfully!");
     }
 
     @Override
@@ -82,13 +95,15 @@ public final class BreakAllBlocks extends JavaPlugin {
         if (waveManager  != null) waveManager.cancelAll();
         if (worldScanner != null) worldScanner.cancelAll();
         if (eliminationManager != null) eliminationManager.save();
-        getLogger().info("BreakAllBlocks disabled. All data saved.");
+        getLogger().info("[BAB] Disabled. All data saved.");
     }
 
     // ── Accessors ──────────────────────────────────────────────────────────
 
-    public ConfigManager      getConfigManager()      { return configManager; }
-    public EliminationManager getEliminationManager() { return eliminationManager; }
-    public WaveManager        getWaveManager()        { return waveManager; }
-    public WorldScanner       getWorldScanner()       { return worldScanner; }
+    public ConfigManager       getConfigManager()       { return configManager; }
+    public EliminationManager  getEliminationManager()  { return eliminationManager; }
+    public EntityMappingManager getEntityMappingManager(){ return entityMappingManager; }
+    public WaveManager         getWaveManager()         { return waveManager; }
+    public UndoManager         getUndoManager()         { return undoManager; }
+    public WorldScanner        getWorldScanner()        { return worldScanner; }
 }

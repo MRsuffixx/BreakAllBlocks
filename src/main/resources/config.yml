@@ -1,31 +1,53 @@
 # BreakAllBlocks Configuration
-# Author: MRsuffix
+# Author: MRsuffix | Version: 1.1.0
+# Wave-propagation mode: blocks cascade outward from the origin using BFS.
 
-# Enable or disable the entire plugin mechanic
+# ──────────────────────────────────────────
+#  CORE
+# ──────────────────────────────────────────
 enabled: true
 
-# How many blocks to remove per scheduler tick during a mass-elimination sweep
-batch_size: 500
+# ──────────────────────────────────────────
+#  WAVE SYSTEM
+# ──────────────────────────────────────────
 
-# How many ticks to wait between processing each batch (1 tick = 50ms)
-batch_delay_ticks: 1
+# Blocks broken per scheduler tick. Higher = faster wave, more main-thread work.
+# Recommended: 10–20 for survival; 50–200 for events.
+wave_speed: 10
 
-# Whether to broadcast elimination messages to all online players
+# Ticks between each wave processing step (1 tick = 50 ms). Minimum: 1.
+wave_tick_interval: 1
+
+# Maximum simultaneous wave tasks. Excess waves queue and auto-start.
+max_active_waves: 3
+
+# true  → block.breakNaturally()  (drops loot, plays sound — cinematic!)
+# false → block.setType(AIR)      (silent, better for huge waves)
+drop_items: true
+
+# ──────────────────────────────────────────
+#  UNDO SYSTEM
+# ──────────────────────────────────────────
+
+# How many past wave events to keep for /bab undo (in-memory, lost on restart).
+undo_history_size: 10
+
+# Max block positions tracked per event. 0 = unlimited (not recommended for common blocks).
+# If exceeded the wave continues but undo will be partial.
+undo_max_blocks: 100000
+
+# ──────────────────────────────────────────
+#  GENERAL SETTINGS
+# ──────────────────────────────────────────
+
 broadcast_messages: true
-
-# If true, block break events caused by pistons/explosions also trigger elimination
-# Set to false to only react to direct player breaks
 count_indirect_breaks: false
-
-# If true, players in Creative mode also trigger elimination
 count_creative_breaks: false
 
-# List of world names where BreakAllBlocks is active.
-# Leave empty to enable in ALL worlds.
+# Active worlds (empty = all worlds).
 worlds: []
 
-# Materials that are IMMUNE to elimination.
-# Add material names (uppercase) from https://jd.papermc.io/paper/1.20/org/bukkit/Material.html
+# Materials IMMUNE to elimination (config-level; use /bab exclude for runtime).
 excluded_materials:
   - BEDROCK
   - BARRIER
@@ -40,24 +62,85 @@ excluded_materials:
   - AIR
   - CAVE_AIR
   - VOID_AIR
+  - WATER
+  - LAVA
 
-# Messages — supports MiniMessage tags (<red>, <bold>, <gradient:...>, etc.)
+# ──────────────────────────────────────────
+#  MOB KILL → BLOCK MAPPINGS
+# ──────────────────────────────────────────
+# When a player kills the listed entity type, waves are started for every
+# mapped block material. Remove entries or leave the list empty to disable.
+entity_block_mappings:
+  COW:             [GRASS_BLOCK, DIRT]
+  SHEEP:           [WHITE_WOOL, GRASS_BLOCK]
+  PIG:             [DIRT, COARSE_DIRT]
+  CHICKEN:         [EGG, WHEAT_SEEDS]
+  CREEPER:         [STONE, COBBLESTONE]
+  ZOMBIE:          [DIRT, GRAVEL]
+  SKELETON:        [BONE_BLOCK, CALCITE]
+  ENDERMAN:        [END_STONE, OBSIDIAN]
+  SPIDER:          [COBWEB, BROWN_MUSHROOM_BLOCK]
+  BLAZE:           [NETHERRACK, MAGMA_BLOCK]
+  WITHER_SKELETON: [BLACKSTONE, BASALT]
+  WITCH:           [MUSHROOM_STEM, RED_MUSHROOM_BLOCK]
+  DROWNED:         [SAND, SANDSTONE]
+  HUSK:            [SAND, DEAD_BUSH]
+  SLIME:           [SLIME_BLOCK, MOSS_BLOCK]
+  MAGMA_CUBE:      [MAGMA_BLOCK, NETHERRACK]
+  GUARDIAN:        [PRISMARINE, SEA_LANTERN]
+  ELDER_GUARDIAN:  [PRISMARINE_BRICKS, DARK_PRISMARINE]
+  SHULKER:         [PURPUR_BLOCK, END_STONE_BRICKS]
+  PILLAGER:        [DARK_OAK_PLANKS, COBBLESTONE]
+  RAVAGER:         [STONE_BRICKS, CRACKED_STONE_BRICKS]
+
+# ──────────────────────────────────────────
+#  MESSAGES  (MiniMessage format)
+# ──────────────────────────────────────────
 messages:
   prefix: "<dark_gray>[<gradient:#FF6B6B:#FFD93D>BreakAllBlocks</gradient>]</dark_gray> "
-  elimination_broadcast: "{prefix}<gold><bold>{player}</bold></gold> <red>has destroyed ALL <bold>{block}</bold> in the world! They are gone <italic>forever</italic>.</red>"
+
+  elimination_broadcast: "{prefix}<gold><bold>{player}</bold></gold> <red>shattered every <bold>{block}</bold>! A destruction wave is spreading... gone <italic>forever</italic>.</red>"
+
+  mob_kill_broadcast: "{prefix}<gold><bold>{player}</bold></gold> <red>slew a <bold>{entity}</bold>! All <bold>{block}</bold> now crumble...</red>"
+
   already_eliminated: "{prefix}<red>This block type has already been eliminated from the world.</red>"
+
   excluded_material: "{prefix}<yellow>This block type is protected and cannot be eliminated.</yellow>"
+
   plugin_disabled: "{prefix}<gray>BreakAllBlocks is currently disabled.</gray>"
+
   world_not_active: "{prefix}<gray>BreakAllBlocks is not active in this world.</gray>"
-  reload_success: "{prefix}<green>Configuration reloaded successfully.</green>"
-  restore_success: "{prefix}<green>Restored <yellow>{block}</yellow>. Players may break it again.</green>"
+
+  wave_active: "{prefix}<aqua>A wave for <yellow>{block}</yellow> is already spreading — your break was merged.</aqua>"
+
+  reload_success: "{prefix}<green>Configuration reloaded.</green>"
+
+  restore_success: "{prefix}<green>Restored <yellow>{block}</yellow>. Players can break it again.</green>"
+
   restore_not_found: "{prefix}<red><yellow>{block}</yellow> is not in the eliminated list.</red>"
+
   resetall_success: "{prefix}<green>All eliminated materials have been cleared.</green>"
-  list_header: "{prefix}<yellow>Eliminated block types (<gold>{count}</gold>):</yellow>"
+
+  list_header: "{prefix}<yellow>Eliminated materials (<gold>{count}</gold>):</yellow>"
+
   list_empty: "{prefix}<gray>No block types have been eliminated yet.</gray>"
+
   list_entry: "  <gray>- <white>{block}</white></gray>"
-  no_permission: "{prefix}<red>You don't have permission to use this command.</red>"
-  usage: "{prefix}<red>Usage: /bab <reload|list|restore <material>|resetall></red>"
-  invalid_material: "{prefix}<red>'<yellow>{input}</yellow>' is not a valid material name.</red>"
-  scan_started: "{prefix}<aqua>Mass-elimination sweep started for <yellow>{block}</yellow>. Scanning <bold>{chunks}</bold> loaded chunks...</aqua>"
-  scan_complete: "{prefix}<green>Sweep complete for <yellow>{block}</yellow>. Removed <bold>{count}</bold> blocks.</green>"
+
+  no_permission: "{prefix}<red>You don't have permission.</red>"
+
+  usage: "{prefix}<red>Usage: /bab <help|list|status|reload|restore|resetall|waves|exclude|include|undo></red>"
+
+  invalid_material: "{prefix}<red>'<yellow>{input}</yellow>' is not a valid Minecraft material.</red>"
+
+  scan_started: "{prefix}<aqua>Startup cleanup wave started for <yellow>{block}</yellow>...</aqua>"
+
+  scan_complete: "{prefix}<green>Wave complete for <yellow>{block}</yellow>. <bold>{count}</bold> blocks destroyed.</green>"
+
+  undo_broadcast: "{prefix}<aqua><bold>{admin}</bold> reversed the elimination of <yellow>{block}</yellow>. Blocks restored.</aqua>"
+
+  exclude_success: "{prefix}<green><yellow>{block}</yellow> is now protected at runtime. Use /bab include to undo.</green>"
+
+  include_success: "{prefix}<green>Runtime protection removed from <yellow>{block}</yellow>.</green>"
+
+  material_not_excluded: "{prefix}<red><yellow>{block}</yellow> is not in the runtime exclusion list.</red>"

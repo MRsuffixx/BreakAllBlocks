@@ -1,24 +1,28 @@
 name: BreakAllBlocks
-version: '${project.version}'
+version: 1.1.0
 main: com.mrsuffix.breakallblocks.BreakAllBlocks
-api-version: '1.20'
+api-version: "1.21"
 author: MRsuffix
-description: When a player breaks a block, every block of that type is removed from the world — forever.
+description: >-
+  Break any block and a BFS wave destroys every connected block of that type.
+  Kill a mob and its mapped block types begin crumbling. Permanent. Irreversible.
 
 commands:
   bab:
-    description: BreakAllBlocks admin command
-    usage: /bab <reload|list|restore|resetall> [material]
+    description: BreakAllBlocks admin & info commands
+    usage: /bab <help|list|status|reload|restore|resetall|waves|exclude|include|undo> [args]
     permission: breakallblocks.admin
-    aliases: [breakallblocks]
+    aliases: [breakallblocks, bab]
 
 permissions:
   breakallblocks.admin:
     description: Access to all /bab admin commands
     default: op
-  breakallblocks.bypass:
-    description: Bypass the block-break restriction (can still break eliminated blocks)
-    default: false
+
   breakallblocks.use:
-    description: Trigger block-type elimination on break
+    description: Player can trigger block eliminations by breaking blocks
     default: true
+
+  breakallblocks.bypass:
+    description: Player can break any block regardless of elimination status
+    default: op
