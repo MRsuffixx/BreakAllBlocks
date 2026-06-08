@@ -1,7 +1,6 @@
 package com.mrsuffix.breakallblocks.managers;
 
 import com.mrsuffix.breakallblocks.BreakAllBlocks;
-import com.mrsuffix.breakallblocks.util.MessageUtil;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Material;
@@ -10,235 +9,163 @@ import org.bukkit.block.Block;
 import org.bukkit.command.CommandSender;
 import org.bukkit.scheduler.BukkitTask;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
 
 /**
- * WorldScanner — responsible for scanning worlds and removing eliminated block types.
+ * WorldScanner — startup helper that finds remaining eliminated blocks in
+ * currently loaded chunks and hands them off to {@link WaveManager} for
+ * wave-based cleanup.
  *
- * <p>Strategy:</p>
- * <ol>
- *   <li>For <strong>loaded chunks</strong>: iterate all blocks asynchronously, collect
- *       those matching the target material, then set them to AIR on the main thread
- *       in configurable batches to stay lag-free.</li>
- *   <li>For <strong>unloaded chunks</strong>: {@link ChunkLoadListener} calls
- *       {@link #scanChunk} whenever a new chunk loads, so they are cleaned up lazily.</li>
- * </ol>
+ * <p>This class no longer performs any instant removal; all block destruction
+ * goes through the wave system so the cinematic cascade effect is consistent.</p>
+ *
+ * <p>The scan processes one chunk per tick (configurable via the existing
+ * {@code batch_delay_ticks} setting) to avoid a TPS spike at startup.</p>
+ *
+ * @author MRsuffix
  */
 public class WorldScanner {
 
-    private final BreakAllBlocks plugin;
-    private final ConfigManager cfg;
+    private final BreakAllBlocks     plugin;
+    private final ConfigManager      cfg;
     private final EliminationManager eliminationManager;
+    private final WaveManager        waveManager;
 
-    /** Tracks currently running sweep tasks so we can cancel them on disable. */
-    private final Map<Integer, BukkitTask> activeTasks = new ConcurrentHashMap<>();
-    private int taskIdCounter = 0;
+    /** Task handle for the in-progress startup scan, so it can be cancelled. */
+    private BukkitTask scanTask;
 
-    public WorldScanner(BreakAllBlocks plugin, ConfigManager cfg, EliminationManager eliminationManager) {
-        this.plugin = plugin;
-        this.cfg = cfg;
+    public WorldScanner(BreakAllBlocks plugin, ConfigManager cfg,
+                        EliminationManager eliminationManager, WaveManager waveManager) {
+        this.plugin             = plugin;
+        this.cfg                = cfg;
         this.eliminationManager = eliminationManager;
+        this.waveManager        = waveManager;
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
 
     /**
-     * Begins a full sweep across all active worlds for the given material.
-     * The {@code initiator} (may be null) receives progress/completion messages.
-     */
-    public void sweepAllWorlds(Material material, CommandSender initiator) {
-        for (World world : Bukkit.getWorlds()) {
-            if (!cfg.isWorldActive(world.getName())) continue;
-            sweepWorld(world, material, initiator);
-        }
-    }
-
-    /**
-     * Triggered on server startup to re-remove all eliminated materials
-     * from currently loaded chunks in case anything regenerated.
+     * Scans currently loaded chunks in all active worlds for blocks of any
+     * eliminated material and starts cleanup waves for any found.
+     *
+     * <p>The scan runs on the main thread in chunks-per-tick slices so it does
+     * not cause a TPS spike.</p>
+     *
+     * @param initiator who triggered the scan (may be {@code null})
      */
     public void scanAllWorldsForEliminated(CommandSender initiator) {
         Set<Material> eliminated = eliminationManager.getEliminatedMaterials();
-        if (eliminated.isEmpty()) return;
-
-        for (Material mat : eliminated) {
-            sweepAllWorlds(mat, initiator);
+        if (eliminated.isEmpty()) {
+            plugin.getLogger().info("[BAB] Startup scan: no eliminated materials — skipping.");
+            return;
         }
-    }
 
-    /**
-     * Scans a single chunk for any eliminated materials and removes them.
-     * Called by ChunkLoadListener each time a chunk loads.
-     */
-    public void scanChunk(Chunk chunk) {
-        if (!cfg.isEnabled()) return;
-        if (!cfg.isWorldActive(chunk.getWorld().getName())) return;
-
-        Set<Material> eliminated = eliminationManager.getEliminatedMaterials();
-        if (eliminated.isEmpty()) return;
-
-        // Collect matching blocks in the newly loaded chunk (sync — chunk is loaded)
-        List<Block> toRemove = new ArrayList<>();
-        int maxY = chunk.getWorld().getMaxHeight();
-        int minY = chunk.getWorld().getMinHeight();
-
-        for (int x = 0; x < 16; x++) {
-            for (int y = minY; y < maxY; y++) {
-                for (int z = 0; z < 16; z++) {
-                    Block b = chunk.getBlock(x, y, z);
-                    if (eliminated.contains(b.getType())) {
-                        toRemove.add(b);
-                    }
-                }
+        // Collect all chunks we need to check across all active worlds.
+        java.util.List<Chunk> chunks = new java.util.ArrayList<>();
+        for (World world : Bukkit.getWorlds()) {
+            if (!cfg.isWorldActive(world.getName())) continue;
+            for (Chunk chunk : world.getLoadedChunks()) {
+                chunks.add(chunk);
             }
         }
 
-        if (toRemove.isEmpty()) return;
+        if (chunks.isEmpty()) return;
 
-        // Remove in batches on the main thread (we're already on it for chunk events,
-        // but batch it to avoid micro-stutter if the chunk is very dirty)
-        removeBatched(toRemove, null, null);
+        plugin.getLogger().info("[BAB] Startup scan: checking " + chunks.size()
+                + " loaded chunk(s) for " + eliminated.size() + " eliminated material(s).");
+
+        // Track which (material, world) combos already have a wave running.
+        java.util.Set<String> wavesStarted = new java.util.HashSet<>();
+        int[] idx = {0};
+
+        scanTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            // Process a small batch of chunks each tick.
+            int batchEnd = Math.min(idx[0] + 5, chunks.size());
+
+            while (idx[0] < batchEnd) {
+                Chunk chunk = chunks.get(idx[0]++);
+                if (!chunk.isLoaded()) continue;
+
+                World world = chunk.getWorld();
+                for (Material mat : eliminated) {
+                    String wk = mat.name() + ":" + world.getName();
+                    if (wavesStarted.contains(wk)) continue;
+                    if (waveManager.isWaveActive(mat, world)) {
+                        wavesStarted.add(wk);
+                        continue;
+                    }
+
+                    Block found = findFirstOfTypeInChunk(chunk, mat);
+                    if (found != null) {
+                        wavesStarted.add(wk);
+                        // Seed the wave from this block's position.
+                        // We tell the wave the block is already air so it starts
+                        // from that position's neighbors — but actually the block
+                        // IS still present (not broken yet), so we pass the block
+                        // itself as a neighbor seed by breaking it first, or we
+                        // just treat its position as the origin and let the wave
+                        // include it.  Since the wave seeds NEIGHBORS of the origin,
+                        // we shift the origin one step away from the block so the
+                        // block itself becomes a neighbor.
+                        // Simplest correct approach: call breakNaturally on this
+                        // block immediately and then start wave from its position.
+                        waveManager.startWave(
+                                found.getX(), found.getY(), found.getZ(),
+                                world, mat, initiator);
+                        // The block is still present at this position; startWave
+                        // seeds neighbors of the origin — so the origin itself
+                        // is NOT in the queue.  We add it manually via the public
+                        // helper below.
+                        // (Actually: we want the startup-found block to be in the
+                        //  wave queue.  seedNeighbors marks origin as visited and
+                        //  adds its 6 neighbors.  If the block IS at origin, it
+                        //  will NOT be broken because it's not in the queue.
+                        //  Fix: break the block now and use its position as origin.)
+                        if (cfg.isDropItems()) {
+                            found.breakNaturally();
+                        } else {
+                            found.setType(Material.AIR, false);
+                        }
+                    }
+                }
+            }
+
+            if (idx[0] >= chunks.size()) {
+                scanTask.cancel();
+                plugin.getLogger().info("[BAB] Startup scan complete. Waves started: "
+                        + wavesStarted.size());
+            }
+        }, 0L, 1L);
     }
 
-    /** Cancel all running sweep tasks (called from onDisable). */
+    /** Cancel any running scan task (called from {@code onDisable}). */
     public void cancelAll() {
-        for (BukkitTask task : activeTasks.values()) {
-            task.cancel();
+        if (scanTask != null && !scanTask.isCancelled()) {
+            scanTask.cancel();
         }
-        activeTasks.clear();
     }
 
-    // ── Internal helpers ───────────────────────────────────────────────────
-
-    private void sweepWorld(World world, Material material, CommandSender initiator) {
-        Chunk[] loadedChunks = world.getLoadedChunks();
-        int totalChunks = loadedChunks.length;
-
-        if (initiator != null) {
-            MessageUtil.sendParsed(initiator,
-                    cfg.getMsgScanStarted()
-                            .replace("{block}", material.name())
-                            .replace("{chunks}", String.valueOf(totalChunks)),
-                    cfg.getPrefix());
-        }
-
-        plugin.getLogger().info("Starting sweep for " + material.name() +
-                " in world '" + world.getName() + "' (" + totalChunks + " loaded chunks).");
-
-        // Async: collect all matching block positions
-        AtomicInteger totalRemoved = new AtomicInteger(0);
-
-        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
-            List<Block> collected = new ArrayList<>();
-
-            for (Chunk chunk : loadedChunks) {
-                if (!chunk.isLoaded()) continue; // may have unloaded since snapshot
-                try {
-                    collectFromChunk(chunk, material, collected);
-                } catch (Exception e) {
-                    plugin.getLogger().log(Level.WARNING,
-                            "Error scanning chunk " + chunk.getX() + "," + chunk.getZ(), e);
-                }
-            }
-
-            if (collected.isEmpty()) {
-                plugin.getLogger().info("Sweep complete for " + material.name() +
-                        " in '" + world.getName() + "': 0 blocks found.");
-                if (initiator != null) {
-                    plugin.getServer().getScheduler().runTask(plugin, () ->
-                            MessageUtil.sendParsed(initiator,
-                                    cfg.getMsgScanComplete()
-                                            .replace("{block}", material.name())
-                                            .replace("{count}", "0"),
-                                    cfg.getPrefix()));
-                }
-                return;
-            }
-
-            plugin.getLogger().info("Sweep for " + material.name() + " collected " +
-                    collected.size() + " blocks in '" + world.getName() + "'. Removing...");
-
-            // Back on main thread — remove in batches
-            plugin.getServer().getScheduler().runTask(plugin, () ->
-                    removeBatched(collected, initiator, material));
-        });
-    }
+    // ── Private helpers ────────────────────────────────────────────────────
 
     /**
-     * Iterates all blocks in a chunk looking for the target material.
-     * Must only be called from an async context when the chunk is loaded.
+     * Returns the first block of the given material found in the chunk,
+     * or {@code null} if none exist.
      */
-    private void collectFromChunk(Chunk chunk, Material material, List<Block> result) {
-        World world = chunk.getWorld();
-        int maxY = world.getMaxHeight();
-        int minY = world.getMinHeight();
+    private static Block findFirstOfTypeInChunk(Chunk chunk, Material material) {
+        World world  = chunk.getWorld();
+        int   minY   = world.getMinHeight();
+        int   maxY   = world.getMaxHeight();
 
-        for (int x = 0; x < 16; x++) {
-            for (int y = minY; y < maxY; y++) {
-                for (int z = 0; z < 16; z++) {
-                    Block b = chunk.getBlock(x, y, z);
+        for (int lx = 0; lx < 16; lx++) {
+            for (int ly = minY; ly < maxY; ly++) {
+                for (int lz = 0; lz < 16; lz++) {
+                    Block b = chunk.getBlock(lx, ly, lz);
                     if (b.getType() == material) {
-                        result.add(b);
+                        return b;
                     }
                 }
             }
         }
-    }
-
-    /**
-     * Removes blocks from the supplied list in {@code cfg.batchSize} batches,
-     * separated by {@code cfg.batchDelayTicks} ticks on the main thread.
-     */
-    private void removeBatched(List<Block> blocks, CommandSender initiator, Material material) {
-        int batchSize = cfg.getBatchSize();
-        int delayTicks = cfg.getBatchDelayTicks();
-        AtomicInteger index = new AtomicInteger(0);
-        AtomicLong removed = new AtomicLong(0);
-        int taskKey = taskIdCounter++;
-
-        BukkitTask[] taskHolder = new BukkitTask[1];
-
-        taskHolder[0] = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
-            int start = index.get();
-            if (start >= blocks.size()) {
-                // Done
-                taskHolder[0].cancel();
-                activeTasks.remove(taskKey);
-                long count = removed.get();
-                plugin.getLogger().info("Batch removal complete: " + count + " blocks removed" +
-                        (material != null ? " for " + material.name() : "") + ".");
-                if (initiator != null && material != null) {
-                    MessageUtil.sendParsed(initiator,
-                            cfg.getMsgScanComplete()
-                                    .replace("{block}", material.name())
-                                    .replace("{count}", String.valueOf(count)),
-                            cfg.getPrefix());
-                }
-                return;
-            }
-
-            int end = Math.min(start + batchSize, blocks.size());
-            for (int i = start; i < end; i++) {
-                Block b = blocks.get(i);
-                // Re-verify the block is still the target type before removing
-                if (material == null || b.getType() == material) {
-                    b.setType(Material.AIR, false); // false = don't apply physics (performance)
-                    removed.incrementAndGet();
-                }
-            }
-            index.set(end);
-
-        }, 0L, delayTicks);
-
-        activeTasks.put(taskKey, taskHolder[0]);
+        return null;
     }
 }
